@@ -117,7 +117,7 @@ export default function PostQuestionForm() {
 
             if (data.id) {
                 const stripe = await stripePromise;
-                const result = await stripe?.redirectToCheckout({ sessionId: data.id });
+                const result = await (stripe as any)?.redirectToCheckout({ sessionId: data.id });
                 if (result?.error) alert(`決済エラー: ${result.error.message}`);
             } else {
                 alert('【Stripe連動確認】\n現在有効なAPIキーが設定されていないため、モック動作を行います。');

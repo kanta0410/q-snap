@@ -33,8 +33,8 @@ export default function AdminPage() {
     const fetchData = async () => {
         try {
             // 完全に本番想定のリセット状態。ローカルストレージに何か入っていれば表示。
-            const mockStudents = [];
-            const mockTutors = [];
+            const mockStudents: any[] = [];
+            const mockTutors: any[] = [];
 
             let hasUsageData = false;
             Object.keys(localStorage).forEach(k => {
