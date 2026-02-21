@@ -1,8 +1,8 @@
 'use client';
 import { useState, useEffect } from 'react';
-import { supabase } from '@/lib/supabaseClient';
 import Link from 'next/link';
 import { Download, Calendar, FileSpreadsheet, ShieldCheck, FileText, UserPlus, Database, KeyRound } from 'lucide-react';
+import { getAdminData, registerUser, deleteUser } from '@/app/actions';
 
 export default function AdminPage() {
     const [passwordInput, setPasswordInput] = useState('');
@@ -14,7 +14,6 @@ export default function AdminPage() {
     const [selectedMonth, setSelectedMonth] = useState(`${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`);
     const [exportHistory, setExportHistory] = useState<{ date: string, filename: string }[]>([]);
 
-    // 生徒情報の事前登録用 state
     const [regStudentId, setRegStudentId] = useState('');
     const [regStudentPassword, setRegStudentPassword] = useState('');
     const [regStudentGrade, setRegStudentGrade] = useState('中1');
@@ -32,35 +31,13 @@ export default function AdminPage() {
 
     const fetchData = async () => {
         try {
-            // 完全に本番想定のリセット状態。ローカルストレージに何か入っていれば表示。
-            const mockStudents: any[] = [];
-            const mockTutors: any[] = [];
-
-            let hasUsageData = false;
-            Object.keys(localStorage).forEach(k => {
-                if (k.startsWith('mock_usage_')) {
-                    hasUsageData = true;
-                    const userId = k.replace('mock_usage_', '');
-                    const mins = parseInt(localStorage.getItem(k) || '0');
-                    if (mins > 0) {
-                        mockStudents.push({ id: userId, total_usage_minutes: mins });
-                    }
-                }
-            });
-
-            const tutorAnswers = parseInt(localStorage.getItem('mock_tutor_answers') || '0');
-            if (tutorAnswers > 0) {
-                mockTutors.push({ tutor_id: "TUTOR (テスト講師)", answer_count: tutorAnswers });
-            }
-
-            setStudents(mockStudents);
-            setTutors(mockTutors);
+            const data = await getAdminData();
+            setStudents(data.students || []);
+            setTutors(data.tutors || []);
+            setRegisteredStudents(data.registeredStudents || []);
 
             const history = localStorage.getItem('mock_csv_history');
             if (history) setExportHistory(JSON.parse(history));
-
-            const savedStudents = localStorage.getItem('mock_registered_students');
-            if (savedStudents) setRegisteredStudents(JSON.parse(savedStudents));
         } catch (err) {
             console.error(err);
         }
@@ -70,30 +47,37 @@ export default function AdminPage() {
         if (isAuthenticated) fetchData();
     }, [selectedMonth, isAuthenticated]);
 
-    const handleRegisterStudent = (e: React.FormEvent) => {
+    const handleRegisterStudent = async (e: React.FormEvent) => {
         e.preventDefault();
         if (!regStudentId || !regStudentPassword) {
             alert('生徒IDとパスワードの両方を設定してください');
             return;
         }
-        const newStudents = [{ id: regStudentId, password: regStudentPassword, grade: regStudentGrade }, ...registeredStudents];
-        setRegisteredStudents(newStudents);
-        localStorage.setItem('mock_registered_students', JSON.stringify(newStudents));
-        setRegStudentId('');
-        setRegStudentPassword('');
-        alert(`生徒ID「${regStudentId}」をデータベースに登録しました！\n生徒はこのIDとパスワードでログインできます。`);
+        try {
+            await registerUser(regStudentId, regStudentPassword, 'student', regStudentGrade);
+            alert(`生徒ID「${regStudentId}」をデータベースに登録しました！`);
+            setRegStudentId('');
+            setRegStudentPassword('');
+            fetchData();
+        } catch (e) {
+            alert('登録に失敗しました');
+        }
     };
 
-    const handleDeleteRegisteredStudent = (id: string) => {
-        const newStudents = registeredStudents.filter(s => s.id !== id);
-        setRegisteredStudents(newStudents);
-        localStorage.setItem('mock_registered_students', JSON.stringify(newStudents));
+    const handleDeleteRegisteredStudent = async (id: string) => {
+        if (!confirm(`${id} を削除しますか？`)) return;
+        try {
+            await deleteUser(id);
+            fetchData();
+        } catch (e) {
+            alert('削除失敗');
+        }
     }
 
     const handleExportCSV = () => {
         const header = "種別,ユーザーID,実績・利用時間(分),対象月\n";
-        const studentRows = students.map(s => `生徒,${s.id},${s.total_usage_minutes},${selectedMonth}`).join("\n");
-        const tutorRows = tutors.map(t => `講師,${t.tutor_id},${t.answer_count},${selectedMonth}`).join("\n");
+        const studentRows = students.map(s => `生徒,${s.id},${s.remaining_minutes},${selectedMonth}`).join("\n");
+        const tutorRows = tutors.map(t => `講師,${t.id},${t.answer_count},${selectedMonth}`).join("\n");
         const csvContent = header + studentRows + "\n" + tutorRows;
 
         const blob = new Blob(["\uFEFF" + csvContent], { type: 'text/csv;charset=utf-8;' });
@@ -213,12 +197,12 @@ export default function AdminPage() {
                     {/* 右側：サマリー */}
                     <div className="space-y-6">
                         <div className="bg-white border-2 border-gray-200 p-8 rounded-[2rem] shadow-sm">
-                            <h2 className="text-2xl font-black mb-5 flex items-center text-gray-900"><span className="bg-indigo-100 text-indigo-600 p-2 rounded-xl mr-3">🎓</span> 利用状況サマリー</h2>
+                            <h2 className="text-2xl font-black mb-5 flex items-center text-gray-900"><span className="bg-indigo-100 text-indigo-600 p-2 rounded-xl mr-3">🎓</span> 生徒残り時間</h2>
                             <ul className="space-y-3">
                                 {students.length === 0 ? <li className="text-gray-400 font-bold text-center py-4">データなし</li> : students.map((s, idx) => (
                                     <li key={idx} className="flex justify-between items-center bg-gray-50 p-4 rounded-2xl border-2 border-gray-100 shadow-inner">
                                         <span className="text-black font-extrabold">{s.id}</span>
-                                        <div><span className="text-indigo-600 font-black text-xl">{s.total_usage_minutes}</span> <span className="text-xs font-bold text-gray-500">分</span></div>
+                                        <div><span className="text-indigo-600 font-black text-xl">{s.remaining_minutes}</span> <span className="text-xs font-bold text-gray-500">分</span></div>
                                     </li>
                                 ))}
                             </ul>
@@ -229,7 +213,7 @@ export default function AdminPage() {
                             <ul className="space-y-3">
                                 {tutors.length === 0 ? <li className="text-gray-400 font-bold text-center py-4">データなし</li> : tutors.map((t, idx) => (
                                     <li key={idx} className="flex justify-between items-center bg-gray-50 p-4 rounded-2xl border-2 border-gray-100 shadow-inner">
-                                        <span className="text-black font-extrabold">{t.tutor_id}</span>
+                                        <span className="text-black font-extrabold">{t.id}</span>
                                         <div><span className="text-green-600 font-black text-xl">{t.answer_count}</span> <span className="text-xs font-bold text-gray-500">件</span></div>
                                     </li>
                                 ))}
@@ -249,26 +233,6 @@ export default function AdminPage() {
                         <button onClick={handleExportCSV} className="flex items-center bg-white text-indigo-900 hover:bg-gray-100 font-black text-xl px-8 py-5 rounded-2xl shadow-[0_6px_0_0_rgba(49,46,129,1)] active:translate-y-2 active:shadow-none transition-all">
                             <Download className="w-6 h-6 mr-3" /> CSVをダウンロード
                         </button>
-                    </div>
-                    <div>
-                        <h4 className="flex items-center text-lg font-black text-indigo-100 mb-4">
-                            <FileSpreadsheet className="w-5 h-5 mr-2" /> 過去の出力履歴（デバイス保存）
-                        </h4>
-                        {exportHistory.length === 0 ? (
-                            <div className="bg-indigo-800/50 border border-indigo-700 p-6 rounded-2xl text-center text-indigo-300 font-bold">まだ出力履歴がありません</div>
-                        ) : (
-                            <ul className="space-y-3 max-h-40 overflow-y-auto pr-2">
-                                {exportHistory.map((hist, idx) => (
-                                    <li key={idx} className="bg-indigo-800/80 hover:bg-indigo-700 p-4 rounded-xl border border-indigo-600 flex justify-between items-center transition-colors">
-                                        <div className="flex items-center">
-                                            <FileText className="w-5 h-5 text-indigo-300 mr-3" />
-                                            <span className="font-extrabold">{hist.filename}</span>
-                                        </div>
-                                        <span className="text-sm text-indigo-200 font-bold bg-indigo-900/50 px-3 py-1 rounded-lg">{hist.date}</span>
-                                    </li>
-                                ))}
-                            </ul>
-                        )}
                     </div>
                 </div>
             </div>

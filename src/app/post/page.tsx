@@ -1,21 +1,12 @@
 'use client';
 import { useState, useEffect } from 'react';
-import { supabase } from '@/lib/supabaseClient';
-import UsageTracker from '@/components/UsageTracker';
 import Link from 'next/link';
 import { Send, UploadCloud, Image as ImageIcon, Phone, Video, CreditCard, Clock, Loader2, List, CheckCircle, UserCircle, RefreshCcw, KeyRound } from 'lucide-react';
 import { loadStripe } from '@stripe/stripe-js';
+import { loginStudent, getStudentUsageData, submitQuestion, fetchMyQuestions, recordStripePurchase } from '@/app/actions';
+import { compressImageToBase64 } from '@/lib/utils';
 
 const stripePromise = loadStripe(process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY || 'pk_test_dummy');
-
-const fileToBase64 = (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.readAsDataURL(file);
-        reader.onload = () => resolve(reader.result as string);
-        reader.onerror = error => reject(error);
-    });
-};
 
 export default function PostQuestionForm() {
     const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -23,12 +14,8 @@ export default function PostQuestionForm() {
     const [studentPasswordInput, setStudentPasswordInput] = useState('');
 
     const [userId, setUserId] = useState<string>('');
-
-    // 持ち時間（残り時間）のステート
-    const [remainingMinutes, setRemainingMinutes] = useState<number>(120);
-
+    const [remainingMinutes, setRemainingMinutes] = useState<number>(0);
     const [viewState, setViewState] = useState<'form' | 'list'>('form');
-
     const [myQuestions, setMyQuestions] = useState<any[]>([]);
 
     const [topic, setTopic] = useState('');
@@ -38,7 +25,7 @@ export default function PostQuestionForm() {
     const [imageFile, setImageFile] = useState<File | null>(null);
     const [loading, setLoading] = useState(false);
 
-    const handleLogin = (e: React.FormEvent) => {
+    const handleLogin = async (e: React.FormEvent) => {
         e.preventDefault();
         if (!studentIdInput || !studentPasswordInput) {
             alert('生徒IDとパスワードの両方を入力してください。');
@@ -46,65 +33,31 @@ export default function PostQuestionForm() {
         }
 
         try {
-            const registeredStr = localStorage.getItem('mock_registered_students');
-            if (!registeredStr) {
-                alert('システムに生徒アカウント情報が存在しません。管理者に登録を依頼してください。');
-                return;
-            }
-
-            const studentsDB = JSON.parse(registeredStr);
-            const found = studentsDB.find((s: any) => s.id === studentIdInput);
-
-            if (!found) {
-                alert('入力された生徒IDはシステムに登録されていません。\n(エラーコード: ID_NOT_FOUND)');
-                return;
-            }
-
-            if (found.password && found.password !== studentPasswordInput) {
-                alert('パスワードが間違っています。正しいパスワードを入力してください。');
-                return;
-            }
-
-            setUserId(studentIdInput);
-            setGrade(found.grade);
+            const user = await loginStudent(studentIdInput, studentPasswordInput);
+            setUserId(user.id);
+            setGrade(user.grade);
+            setRemainingMinutes(user.remaining_minutes);
             setIsGradeAutoAssigned(true);
             setIsLoggedIn(true);
-
-            // 持ち時間をロード（初期状態は120）
-            const localRem = localStorage.getItem(`mock_remaining_${studentIdInput}`);
-            if (localRem) {
-                setRemainingMinutes(parseInt(localRem));
-            } else {
-                const initialRem = 120;
-                setRemainingMinutes(initialRem);
-                localStorage.setItem(`mock_remaining_${studentIdInput}`, String(initialRem));
-            }
-
-        } catch (e) {
-            alert('システムエラーが発生しました。');
+        } catch (e: any) {
+            alert(`ログイン失敗: ${e.message}`);
         }
+    };
+
+    const loadData = async () => {
+        if (!isLoggedIn) return;
+        try {
+            const qs = await fetchMyQuestions(userId);
+            setMyQuestions(qs);
+            const mins = await getStudentUsageData(userId);
+            setRemainingMinutes(mins);
+        } catch (e) { console.error(e); }
     };
 
     useEffect(() => {
         if (!isLoggedIn) return;
-        const interval = setInterval(() => {
-            setMyQuestions(prev => {
-                let hasChanges = false;
-                const updated = prev.map(q => {
-                    if (q.status === '待機中' || q.status === 'マッチング完了') {
-                        const tutorSignal = localStorage.getItem(`mock_match_${q.id}`);
-                        if (tutorSignal && tutorSignal !== q.status) {
-                            hasChanges = true;
-                            // グローバルストレージから最新のデータ（ミーティングURLなど）を取得して結合
-                            const globalData = JSON.parse(localStorage.getItem(`mock_global_pending_${q.id}`) || '{}');
-                            return { ...q, status: tutorSignal, meeting_url: globalData.meeting_url };
-                        }
-                    }
-                    return q;
-                });
-                return hasChanges ? updated : prev;
-            });
-        }, 1500);
+        loadData(); // Initial load
+        const interval = setInterval(loadData, 5000);
         return () => clearInterval(interval);
     }, [isLoggedIn]);
 
@@ -121,9 +74,8 @@ export default function PostQuestionForm() {
                 if (result?.error) alert(`決済エラー: ${result.error.message}`);
             } else {
                 alert('【Stripe連動確認】\n現在有効なAPIキーが設定されていないため、モック動作を行います。');
-                const newRem = remainingMinutes + 60;
-                setRemainingMinutes(newRem);
-                localStorage.setItem(`mock_remaining_${userId}`, String(newRem));
+                await recordStripePurchase(userId, 60);
+                await loadData();
             }
         } catch (err: any) {
             alert(`サーバー接続エラー: ${err.message}`);
@@ -135,13 +87,13 @@ export default function PostQuestionForm() {
             const urlParams = new URLSearchParams(window.location.search);
             if (urlParams.get('checkout') === 'success' && isLoggedIn) {
                 alert('追加チケットの購入が完了しました！持ち時間が1時間追加されました。');
-                const newRem = remainingMinutes + 60;
-                setRemainingMinutes(newRem);
-                localStorage.setItem(`mock_remaining_${userId}`, String(newRem));
-                window.history.replaceState({}, document.title, window.location.pathname);
+                recordStripePurchase(userId, 60).then(() => {
+                    loadData();
+                    window.history.replaceState({}, document.title, window.location.pathname);
+                });
             }
         }
-    }, [isLoggedIn, remainingMinutes, userId]);
+    }, [isLoggedIn, userId]);
 
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -157,39 +109,16 @@ export default function PostQuestionForm() {
         setLoading(true);
 
         try {
-            const newQuestionId = `Q-${Math.floor(Math.random() * 10000)}`;
+            const base64Img = await compressImageToBase64(imageFile);
 
-            let base64Img = '';
-            try {
-                base64Img = await fileToBase64(imageFile);
-            } catch (e) {
-                console.warn("Base64変換エラー");
-            }
+            await submitQuestion(userId, grade, requestType, base64Img);
 
-            localStorage.setItem(`mock_global_pending_${newQuestionId}`, JSON.stringify({
-                id: newQuestionId,
-                topic,
-                student_grade: grade,
-                request_type: requestType,
-                date: new Date().toLocaleDateString(),
-                image: base64Img
-            }));
+            await loadData(); // Reload minutes and questions
 
-            const newQuestion = {
-                id: newQuestionId, topic: topic, status: "待機中", request_type: requestType, date: new Date().toLocaleDateString()
-            };
-
-            setMyQuestions(prev => [newQuestion, ...prev]);
             setViewState('list');
             setTopic('');
             setImageFile(null);
             setLoading(false);
-
-            // モック：本来は解決済み時に減らすが、ここでは質問時に一定分数消費するデモ
-            const decrement = 15;
-            const newRem = Math.max(0, remainingMinutes - decrement);
-            setRemainingMinutes(newRem);
-            localStorage.setItem(`mock_remaining_${userId}`, String(newRem));
 
         } catch (err: any) {
             alert(`通信エラー: ${err.message}`);
@@ -263,37 +192,44 @@ export default function PostQuestionForm() {
                                 まだ質問はありません。「＋ 新しい質問」から投稿してください。
                             </div>
                         ) : myQuestions.map((q, idx) => (
-                            <div key={idx} className={`bg-gray-50 p-5 md:p-8 rounded-[1.5rem] md:rounded-3xl border-2 ${q.status === '待機中' ? 'border-orange-200 shadow-md ring-2 ring-orange-50' : q.status === 'マッチング完了' ? 'border-green-200 shadow-sm' : 'border-gray-200'} flex flex-col md:flex-row justify-between items-start md:items-center hover:shadow-lg transition-all relative overflow-hidden group`}>
+                            <div key={idx} className={`bg-gray-50 p-5 md:p-8 rounded-[1.5rem] md:rounded-3xl border-2 ${q.status === 'pending' ? 'border-orange-200 shadow-md ring-2 ring-orange-50' : q.status === 'in_progress' ? 'border-green-200 shadow-sm' : 'border-gray-200'} flex flex-col md:flex-row justify-between items-start md:items-center hover:shadow-lg transition-all relative overflow-hidden group`}>
 
-                                {q.status === '待機中' && <div className="absolute top-0 left-0 w-full h-1.5 md:h-2 bg-gradient-to-r from-orange-400 to-yellow-400"></div>}
-                                {q.status === 'マッチング完了' && <div className="absolute top-0 left-0 w-full h-1.5 md:h-2 bg-green-500"></div>}
+                                {q.status === 'pending' && <div className="absolute top-0 left-0 w-full h-1.5 md:h-2 bg-gradient-to-r from-orange-400 to-yellow-400"></div>}
+                                {q.status === 'in_progress' && <div className="absolute top-0 left-0 w-full h-1.5 md:h-2 bg-green-500"></div>}
 
                                 <div className="flex-1 w-full">
                                     <div className="flex flex-wrap items-center gap-2 mb-3">
-                                        {q.status === '待機中' && <span className="flex items-center px-3 py-1 text-[10px] md:text-xs font-black rounded-full bg-orange-100 text-orange-700 shadow-sm"><Loader2 className="w-3 h-3 mr-1.5 animate-spin" /> 講師の待機中・応答待ち...</span>}
-                                        {q.status === 'マッチング完了' && <span className="flex items-center px-3 py-1 text-[10px] md:text-xs font-black rounded-full bg-green-100 text-green-800 border-2 border-green-200 shadow-sm"><CheckCircle className="w-3 h-3 mr-1.5" /> マッチング完了・対応中</span>}
-                                        {q.status === '解決済み' && <span className="px-3 py-1 text-[10px] md:text-xs font-black rounded-full bg-white border border-gray-300 text-gray-600 shadow-sm">解決済み</span>}
-                                        <span className="text-gray-400 font-bold text-xs">{q.id}</span>
+                                        {q.status === 'pending' && <span className="flex items-center px-3 py-1 text-[10px] md:text-xs font-black rounded-full bg-orange-100 text-orange-700 shadow-sm"><Loader2 className="w-3 h-3 mr-1.5 animate-spin" /> 講師の待機中・応答待ち...</span>}
+                                        {q.status === 'in_progress' && <span className="flex items-center px-3 py-1 text-[10px] md:text-xs font-black rounded-full bg-green-100 text-green-800 border-2 border-green-200 shadow-sm"><CheckCircle className="w-3 h-3 mr-1.5" /> マッチング完了・対応中</span>}
+                                        {q.status === 'resolved' && <span className="px-3 py-1 text-[10px] md:text-xs font-black rounded-full bg-white border border-gray-300 text-gray-600 shadow-sm">解決済み</span>}
+                                        <span className="text-gray-400 font-bold text-xs">{q.id.split('-')[0]}</span>
                                     </div>
-                                    <h3 className="text-xl md:text-2xl font-black text-black mb-2 leading-tight">{q.topic}</h3>
+                                    <h3 className="text-xl md:text-2xl font-black text-black mb-2 leading-tight">No. {idx + 1}</h3>
                                     <p className="text-gray-500 font-bold text-xs md:text-sm flex items-center">
                                         希望形式: <span className="text-indigo-600 bg-indigo-50 px-2 py-0.5 md:py-1 rounded-md ml-2 font-black leading-none">{q.request_type}</span>
                                     </p>
+
+                                    {q.tutor_reply_text && (
+                                        <div className="mt-4 p-4 bg-indigo-50 border border-indigo-100 rounded-xl text-indigo-900 font-bold text-sm">
+                                            <span className="block text-indigo-400 text-xs mb-1">講師からのメッセージ:</span>
+                                            {q.tutor_reply_text}
+                                        </div>
+                                    )}
                                 </div>
 
-                                <div className="mt-4 md:mt-0 w-full md:w-auto shrink-0 md:ml-6 flex items-center justify-center">
-                                    {q.status === '待機中' ? (
+                                <div className="mt-4 md:mt-0 w-full md:w-auto shrink-0 md:ml-6 flex flex-col gap-2 items-center justify-center">
+                                    {q.status === 'pending' ? (
                                         <button className="w-full md:w-auto bg-gray-200 text-gray-400 cursor-not-allowed font-black px-6 py-3.5 md:py-5 rounded-xl border-2 border-gray-300 opacity-60 flex items-center justify-center text-sm md:text-lg">
                                             <RefreshCcw className="w-4 h-4 md:w-5 md:h-5 mr-2 animate-spin-slow" />応答を待つ
                                         </button>
-                                    ) : q.status === 'マッチング完了' && q.request_type.includes('通話') ? (
+                                    ) : q.status === 'in_progress' && q.meeting_url ? (
                                         <button onClick={() => { if (q.meeting_url) window.open(q.meeting_url, '_blank') }} className="w-full md:w-auto bg-green-600 hover:bg-green-700 text-white font-black text-sm md:text-lg px-6 py-3.5 md:py-5 rounded-xl md:rounded-2xl shadow-[0_4px_0_0_rgba(21,128,61,1)] active:translate-y-1 md:active:translate-y-2 active:shadow-none transition-all flex items-center justify-center">
                                             <Video className="w-4 h-4 md:w-5 md:h-5 mr-2" /> 講師からの通話ルームへ参加
                                         </button>
-                                    ) : q.status === 'マッチング完了' ? (
-                                        <button className="w-full md:w-auto bg-indigo-600 hover:bg-indigo-700 text-white font-black text-sm md:text-lg px-6 py-3.5 md:py-5 rounded-xl md:rounded-2xl shadow-[0_4px_0_0_rgba(67,56,202,1)] active:translate-y-1 md:active:translate-y-2 active:shadow-none transition-all flex items-center justify-center">
-                                            <ImageIcon className="w-4 h-4 md:w-5 md:h-5 mr-2" /> 添削結果を確認
-                                        </button>
+                                    ) : q.status === 'resolved' && q.tutor_reply_image_b64 ? (
+                                        <a href={q.tutor_reply_image_b64} target="_blank" className="w-full md:w-auto bg-indigo-600 hover:bg-indigo-700 text-white font-black text-sm md:text-lg px-6 py-3.5 md:py-5 rounded-xl md:rounded-2xl shadow-[0_4px_0_0_rgba(67,56,202,1)] active:translate-y-1 md:active:translate-y-2 active:shadow-none transition-all flex items-center justify-center cursor-pointer">
+                                            <ImageIcon className="w-4 h-4 md:w-5 md:h-5 mr-2" /> 添削画像を開く
+                                        </a>
                                     ) : (
                                         <button className="w-full md:w-auto bg-white border-2 border-gray-200 hover:bg-gray-100 text-gray-600 font-bold px-6 py-3 md:py-4 rounded-xl transition-colors shadow-sm text-sm">詳細ログ</button>
                                     )}
@@ -308,8 +244,6 @@ export default function PostQuestionForm() {
 
     return (
         <div className="min-h-screen bg-white text-gray-900 font-sans pb-12 selection:bg-indigo-200">
-            <UsageTracker userId={userId} />
-
             <div className="bg-gray-50 border-b-2 border-gray-200 px-4 md:px-6 py-4 flex justify-between items-center sticky top-0 z-50">
                 <Link href="/" className="font-black text-indigo-700 text-xl tracking-tighter hover:text-indigo-900">Q-Snap</Link>
                 <div className="flex items-center space-x-3 md:space-x-4">

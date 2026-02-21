@@ -1,8 +1,9 @@
 'use client';
 import { useState, useEffect } from 'react';
-import { supabase } from '@/lib/supabaseClient';
 import Link from 'next/link';
-import { Video, Phone, Image as ImageIcon, CheckCircle, Send, UploadCloud, FileText, Trash2, Loader2, BellRing, ZoomIn } from 'lucide-react';
+import { Video, Phone, Image as ImageIcon, CheckCircle, Send, UploadCloud, FileText, Trash2, BellRing, ZoomIn } from 'lucide-react';
+import { getTutorQuestions, updateQuestionStatus } from '@/app/actions';
+import { compressImageToBase64 } from '@/lib/utils';
 
 export default function TutorDashboard() {
     const [tutorIdInput, setTutorIdInput] = useState('');
@@ -18,8 +19,29 @@ export default function TutorDashboard() {
     const [replyImage, setReplyImage] = useState<File | null>(null);
     const [submittingReply, setSubmittingReply] = useState(false);
 
-    // 画像拡大モーダル用state
     const [enlargedImage, setEnlargedImage] = useState<string | null>(null);
+
+    const fetchQuestions = async () => {
+        try {
+            const qs = await getTutorQuestions();
+            // Map 'resolved' strings to frontend tab names
+            const mappedQs = qs.map(q => ({
+                ...q,
+                status: q.status === 'resolved' ? 'completed' : q.status
+            }));
+            setQuestions(mappedQs);
+
+            // Update selected question state if it was changed
+            if (selectedQuestion) {
+                const updatedStatus = mappedQs.find(q => q.id === selectedQuestion.id);
+                if (updatedStatus && updatedStatus.status !== selectedQuestion.status) {
+                    setSelectedQuestion(updatedStatus);
+                }
+            }
+        } catch (e) {
+            console.error("Fetch err", e);
+        }
+    };
 
     const handleLogin = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -29,26 +51,9 @@ export default function TutorDashboard() {
         }
     };
 
-    const fetchQuestions = () => {
-        const newQs: any[] = [];
-        Object.keys(localStorage).forEach(k => {
-            if (k.startsWith('mock_global_pending_')) {
-                try {
-                    const q = JSON.parse(localStorage.getItem(k) || '{}');
-                    const statusVal = localStorage.getItem(`mock_match_${q.id}`);
-                    if (statusVal === '解決済み') return;
-                    newQs.push({ ...q, status: statusVal === 'マッチング完了' ? 'in_progress' : 'pending' });
-                } catch (e) { }
-            }
-        });
-
-        newQs.sort((a, b) => b.id.localeCompare(a.id));
-        setQuestions(newQs);
-    };
-
     useEffect(() => {
         if (!isLoggedIn) return;
-        const interval = setInterval(() => fetchQuestions(), 3000);
+        const interval = setInterval(() => fetchQuestions(), 5000);
         return () => clearInterval(interval);
     }, [isLoggedIn]);
 
@@ -59,75 +64,80 @@ export default function TutorDashboard() {
         setReplyImage(null);
     };
 
-    const handleDelete = (e: React.MouseEvent, id: string) => {
+    const handleDelete = async (e: React.MouseEvent, id: string) => {
         e.stopPropagation();
         const pwd = prompt('削除するには管理者パスワードを入力してください（削除パスワード: admin）');
         if (pwd === 'admin') {
-            setQuestions(prev => prev.filter(q => q.id !== id));
-            if (selectedQuestion?.id === id) setSelectedQuestion(null);
-            localStorage.removeItem(`mock_global_pending_${id}`);
-            alert('問題を削除しました。');
+            try {
+                // Delete from supabase via action
+                await updateQuestionStatus(id, tutorIdInput, 'deleted_by_admin', { tutor_reply_text: 'Admin Override' });
+                alert('問題を削除しました。');
+                fetchQuestions();
+                if (selectedQuestion?.id === id) setSelectedQuestion(null);
+            } catch (err) { alert('削除エラー'); }
         }
     };
 
-    const acceptRequestImagesOnly = () => {
+    const acceptRequestImagesOnly = async () => {
         if (!selectedQuestion) return;
-        localStorage.setItem(`mock_match_${selectedQuestion.id}`, 'マッチング完了');
-
-        setQuestions(prev => prev.map(q =>
-            q.id === selectedQuestion.id ? { ...q, status: 'in_progress' } : q
-        ));
-        alert('「対応中」にステータス変更しました！画像と解説を作成して返信してください。');
-        setActiveTab('in_progress');
+        try {
+            await updateQuestionStatus(selectedQuestion.id, tutorIdInput, 'in_progress');
+            alert('「対応中」にステータス変更しました！画像と解説を作成して返信してください。');
+            fetchQuestions();
+            setActiveTab('in_progress');
+        } catch (e) { alert('エラーが発生しました'); }
     };
 
     const submitReply = async () => {
         if (!selectedQuestion) return;
         setSubmittingReply(true);
 
-        if (selectedQuestion.request_type === '画像添削') {
-            localStorage.setItem(`mock_match_${selectedQuestion.id}`, '解決済み');
-            const localAnswers = parseInt(localStorage.getItem('mock_tutor_answers') || '0');
-            localStorage.setItem('mock_tutor_answers', String(localAnswers + 1));
-            alert('回答を送信しました。（解決済み）');
-
-            setQuestions(prev => prev.map(q => q.id === selectedQuestion.id ? { ...q, status: 'completed' } : q));
-            setSelectedQuestion(null);
-            setActiveTab('completed');
-
-        } else {
-            if (!meetingUrl) {
-                alert('ミーティングURLを入力してください');
-                setSubmittingReply(false);
-                return;
+        try {
+            if (selectedQuestion.request_type === '画像添削') {
+                let imgB64 = null;
+                if (replyImage) {
+                    imgB64 = await compressImageToBase64(replyImage);
+                }
+                await updateQuestionStatus(selectedQuestion.id, tutorIdInput, 'resolved', {
+                    tutor_reply_text: replyText,
+                    tutor_reply_image_b64: imgB64
+                });
+                alert('回答を送信しました。（解決済み）');
+                setActiveTab('completed');
+                setSelectedQuestion(null);
+            } else {
+                if (!meetingUrl) {
+                    alert('ミーティングURLを入力してください');
+                    setSubmittingReply(false);
+                    return;
+                }
+                await updateQuestionStatus(selectedQuestion.id, tutorIdInput, 'in_progress', {
+                    meeting_url: meetingUrl
+                });
+                alert('生徒へURLを送信し、マッチング完了しました！通話終了後に完了してください。');
+                setActiveTab('in_progress');
             }
-            localStorage.setItem(`mock_match_${selectedQuestion.id}`, 'マッチング完了');
-
-            const updatedQ = { ...selectedQuestion, status: 'in_progress', meeting_url: meetingUrl };
-            localStorage.setItem(`mock_global_pending_${selectedQuestion.id}`, JSON.stringify(updatedQ));
-
-            setQuestions(prev => prev.map(q => q.id === selectedQuestion.id ? updatedQ : q));
-            alert('生徒へURLを送信し、マッチング完了しました！通話終了後に完了してください。');
-
-            setSelectedQuestion(null);
-            setActiveTab('in_progress');
+            fetchQuestions();
+        } catch (error) {
+            console.error(error);
+            alert('送信エラー');
+        } finally {
+            setSubmittingReply(false);
         }
-
-        setSubmittingReply(false);
     };
 
-    const markAsCompleted = () => {
+    const markAsCompleted = async () => {
         if (!selectedQuestion) return;
         if (window.confirm('通話を終了し、「解決済み」に移行してよろしいですか？')) {
-            setQuestions(prev => prev.map(q => q.id === selectedQuestion.id ? { ...q, status: 'completed' } : q));
-            localStorage.setItem(`mock_match_${selectedQuestion.id}`, '解決済み');
-
-            const localAnswers = parseInt(localStorage.getItem('mock_tutor_answers') || '0');
-            localStorage.setItem('mock_tutor_answers', String(localAnswers + 1));
-
-            alert('実績が加算されました！');
-            setSelectedQuestion(null);
-            setActiveTab('completed');
+            try {
+                await updateQuestionStatus(selectedQuestion.id, tutorIdInput, 'resolved');
+                alert('実績が加算されました！');
+                setActiveTab('completed');
+                setSelectedQuestion(null);
+                fetchQuestions();
+            } catch (e) {
+                alert('完了処理エラー');
+            }
         }
     };
 
@@ -139,6 +149,7 @@ export default function TutorDashboard() {
 
     const filteredQuestions = questions.filter(q => q.status === activeTab);
 
+    // Render Logic below is identical to the previous but changed img.src to image_b64
     if (!isLoggedIn) {
         return (
             <div className="flex flex-col items-center justify-center min-h-screen bg-white text-black font-sans px-4">
@@ -157,7 +168,6 @@ export default function TutorDashboard() {
 
     return (
         <div className="min-h-screen bg-gray-50 text-black font-sans pb-20 selection:bg-indigo-300">
-            {/* 画像拡大モーダル */}
             {enlargedImage && (
                 <div className="fixed inset-0 z-[100] bg-black/90 flex flex-col items-center justify-center p-4" onClick={() => setEnlargedImage(null)}>
                     <button className="absolute top-6 right-6 text-white bg-black/50 hover:bg-white hover:text-black hover:scale-105 active:scale-95 transition-all p-3 rounded-full font-black text-xl flex items-center justify-center w-12 h-12 shadow-lg z-[110]" onClick={() => setEnlargedImage(null)}>✕</button>
@@ -179,7 +189,6 @@ export default function TutorDashboard() {
 
             <div className="max-w-7xl mx-auto p-4 md:p-6 mt-4 grid grid-cols-1 lg:grid-cols-12 gap-6">
 
-                {/* 左側：リスト管理 */}
                 <div className="lg:col-span-5 flex flex-col h-auto lg:h-[85vh]">
                     <div className="flex space-x-2 bg-gray-200 p-1.5 rounded-[1.2rem] mb-4 shadow-inner shrink-0 overflow-x-auto hide-scrollbar">
                         <button onClick={() => { setActiveTab('pending'); setSelectedQuestion(null); }} className={`whitespace-nowrap flex-1 py-3 px-2 text-sm font-black rounded-xl transition-all ${activeTab === 'pending' ? 'bg-white shadow-sm text-indigo-700' : 'text-gray-500'}`}>
@@ -201,20 +210,20 @@ export default function TutorDashboard() {
                                 <div
                                     key={q.id} onClick={() => handleSelectQuestion(q)}
                                     className={`w-full text-left p-3 md:p-4 rounded-2xl border-2 transition-all cursor-pointer flex justify-between items-center group ${selectedQuestion?.id === q.id
-                                            ? activeTab === 'in_progress' ? 'border-green-500 bg-green-50 shadow-[4px_4px_0_0_rgba(34,197,94,0.3)] translate-y-[-2px]' : 'border-indigo-600 bg-indigo-50 shadow-[4px_4px_0_0_rgba(79,70,229,0.3)] translate-y-[-2px]'
-                                            : 'border-gray-200 bg-white hover:border-gray-400 shadow-sm hover:shadow-md'
+                                        ? activeTab === 'in_progress' ? 'border-green-500 bg-green-50 shadow-[4px_4px_0_0_rgba(34,197,94,0.3)] translate-y-[-2px]' : 'border-indigo-600 bg-indigo-50 shadow-[4px_4px_0_0_rgba(79,70,229,0.3)] translate-y-[-2px]'
+                                        : 'border-gray-200 bg-white hover:border-gray-400 shadow-sm hover:shadow-md'
                                         }`}
                                 >
                                     <div className="flex items-center space-x-4 flex-1 min-w-0">
                                         <div className={`flex-shrink-0 w-12 h-12 md:w-14 md:h-14 border-2 rounded-xl flex items-center justify-center overflow-hidden ${selectedQuestion?.id === q.id ? 'bg-white border-indigo-200' : 'bg-gray-100 border-gray-200'}`}>
-                                            {q.image ? <img src={q.image} className="w-full h-full object-cover" /> : getRequestIcon(q.request_type)}
+                                            {q.image_b64 ? <img src={q.image_b64} className="w-full h-full object-cover" /> : getRequestIcon(q.request_type)}
                                         </div>
                                         <div className="flex-1 min-w-0 pr-2">
                                             <div className="flex items-center space-x-2 mb-1">
                                                 <span className={`text-[10px] px-2 py-0.5 rounded-md font-extrabold text-white ${activeTab === 'in_progress' ? 'bg-green-700' : activeTab === 'completed' ? 'bg-gray-500' : 'bg-indigo-600'}`}>{q.student_grade}</span>
-                                                <span className="text-xs text-gray-400 font-bold truncate">{q.id}</span>
+                                                <span className="text-xs text-gray-400 font-bold truncate">{q.id.split('-')[0]}</span>
                                             </div>
-                                            <p className={`font-black text-sm md:text-base truncate leading-tight ${activeTab === 'completed' ? 'text-gray-500' : 'text-gray-900'}`}>{q.topic}</p>
+                                            <p className={`font-black text-sm md:text-base truncate leading-tight ${activeTab === 'completed' ? 'text-gray-500' : 'text-gray-900'}`}>{q.request_type}</p>
                                         </div>
                                     </div>
                                     <button onClick={(e) => handleDelete(e, q.id)} className="text-gray-300 hover:text-red-500 transition-colors p-2 shrink-0">
@@ -226,7 +235,6 @@ export default function TutorDashboard() {
                     </div>
                 </div>
 
-                {/* 右側：回答入力・アクションエリア */}
                 <div className="lg:col-span-7 h-auto lg:h-[85vh] overflow-y-auto pb-10 lg:pr-2">
                     {selectedQuestion ? (
                         <div className="bg-white border-2 border-gray-200 rounded-[2rem] shadow-xl p-5 md:p-8 relative overflow-hidden">
@@ -244,12 +252,12 @@ export default function TutorDashboard() {
                             </div>
 
                             <div className="mb-6 bg-gray-50 rounded-[1.5rem] border-2 border-gray-100 overflow-hidden flex flex-col md:flex-row shadow-sm">
-                                {selectedQuestion.image && (
+                                {selectedQuestion.image_b64 && (
                                     <div
                                         className="md:w-2/5 bg-gray-900 flex items-center justify-center min-h-[150px] cursor-pointer group relative"
-                                        onClick={() => setEnlargedImage(selectedQuestion.image)}
+                                        onClick={() => setEnlargedImage(selectedQuestion.image_b64)}
                                     >
-                                        <img src={selectedQuestion.image} className="w-full h-full object-contain max-h-[300px] group-hover:opacity-70 transition-opacity" alt="生徒がアップロードした問題プレビュー" />
+                                        <img src={selectedQuestion.image_b64} className="w-full h-full object-contain max-h-[300px] group-hover:opacity-70 transition-opacity" alt="生徒がアップロードした問題プレビュー" />
                                         <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
                                             <span className="bg-black/80 text-white font-bold px-4 py-2 rounded-full text-sm flex items-center shadow-lg"><ZoomIn className="w-4 h-4 mr-2" /> クリックで拡大</span>
                                         </div>
@@ -261,7 +269,6 @@ export default function TutorDashboard() {
                                 </div>
                             </div>
 
-                            {/* --- 添削フロー（画像） --- */}
                             {selectedQuestion.request_type === '画像添削' && (
                                 <>
                                     {activeTab === 'pending' && (
@@ -280,7 +287,7 @@ export default function TutorDashboard() {
                                             <div className="border-4 border-dashed border-gray-200 rounded-2xl p-6 text-center hover:bg-indigo-50 hover:border-indigo-300 transition-all cursor-pointer relative">
                                                 <input type="file" onChange={(e) => setReplyImage(e.target.files?.[0] || null)} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
                                                 <UploadCloud className="w-8 h-8 mx-auto mb-2 text-indigo-400" />
-                                                <span className="font-black text-sm">添削済み画像を選択して返信して完了</span>
+                                                <span className="font-black text-sm">{replyImage ? '画像選択済み' : '添削済み画像を選択して返信して完了'}</span>
                                             </div>
                                             <button onClick={submitReply} disabled={submittingReply} className="w-full bg-black hover:bg-gray-800 text-white font-black text-lg px-8 py-4 rounded-xl shadow-[0_4px_0_0_rgba(107,114,128,1)] active:translate-y-1 active:shadow-none transition-all flex justify-center items-center">
                                                 <Send className="w-5 h-5 mr-3" /> 画像と一緒に返信して解決済みにする
@@ -290,7 +297,6 @@ export default function TutorDashboard() {
                                 </>
                             )}
 
-                            {/* --- 通話フロー（音声・ビデオ） --- */}
                             {selectedQuestion.request_type !== '画像添削' && (
                                 <>
                                     {activeTab === 'pending' && (
@@ -323,7 +329,6 @@ export default function TutorDashboard() {
                                 </>
                             )}
 
-                            {/* 回答済み (completed) フォーム */}
                             {activeTab === 'completed' && (
                                 <div className="bg-gray-100 border-2 border-gray-200 p-6 rounded-2xl text-center opacity-70 mt-6">
                                     <CheckCircle className="w-12 h-12 mx-auto text-gray-400 mb-2" />
